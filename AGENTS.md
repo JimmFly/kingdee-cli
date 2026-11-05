@@ -10,11 +10,12 @@
 | 退出码 | code | 含义 / 处理方式 |
 |---|---|---|
 | 0 | — | 成功 |
-| 2 | — | 命令参数错误（argparse） |
-| 3 | `config` / `auth` | 没配置或登录失败，需要人处理 |
+| 1 | `internal` | kd 自身的缺陷，需要人处理 |
+| 2 | — | 命令参数错误（argparse，输出不是 JSON） |
+| 3 | `config` / `auth` | 没配置、配置非法、登录失败或 HTTP 401/403/404，需要人处理 |
 | 4 | `ambiguous` | 中文名匹配到多个表单；`error.candidates` 里有候选 FormId，选一个重试 |
 | 4 | `server` | 金蝶返回业务错误（字段不存在、过滤语法错误、无权限等），按 message 调整 |
-| 5 | `rate_limit` / `network` | 限流或网络问题；kd 已自动重试过，稍后再试 |
+| 5 | `rate_limit` / `network` | 限流、网络问题或 HTTP 5xx；kd 已自动重试过，稍后再试 |
 | 6 | `readonly` | 尝试调用了写接口，这是被禁止的 |
 
 - 表单可以写 FormId（`SAL_SaleOrder`），也可以写中文名（`销售订单`）。
@@ -38,6 +39,8 @@ kd -q query SAL_SaleOrder -f FBillNo,FDate,FCustId.FName -w "FDate>='2025-01-01'
   - 禁用状态 `FForbidStatus`：A 正常、B 禁用。
 - `--order "FDate DESC"` 排序；`-n` 每页行数（默认 100）；`--start` 偏移；`-a` 自动翻页取全部（注意数据量）。
 - 返回 `[{字段: 值}]`。日期是 `2024-12-01T00:00:00` 格式。
+- 小数是原样的十进制数字（如 `1234567890.123456789`），做金额计算时请用十进制类型解析，不要转成 float。
+- 没写 `--order` 时自动按主键排序，用 `--start` 手动翻页也是稳定的。`-a` 会一直翻到空页；加 `--max-pages N` 限制请求页数。
 
 ### 其他读取命令
 
@@ -87,4 +90,4 @@ kd -q report 科目余额表 -f FBALANCEID,FBALANCENAME,FBEGINDEBIT,FBEGINCREDIT
 | 应收单 / 应付单 / 收款单 / 付款单 | `AR_receivable` / `AP_Payable` / `AR_RECEIVEBILL` / `AP_PAYBILL` |
 | 凭证 / 科目 | `GL_VOUCHER` / `BD_Account` |
 
-找不到时：`kd -q forms -k 关键字`。全部可读表单及行数可用 `kd scan` 生成。
+找不到时：`kd -q forms -k 关键字`。全部可读表单及行数可用 `kd scan` 生成（注意：`scan` 的行数是查询返回的行数，含明细时一张单据会有多行，不等于单据数）。

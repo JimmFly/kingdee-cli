@@ -37,7 +37,7 @@ class FakeClient(kd.Client):
         self.responses = list(responses)
         self.calls = []
 
-    def _post(self, path, body, retries=2):
+    def _post(self, path, body, attempts=3):
         self.calls.append((kd.api_name(path), body))
         if not self.responses:
             raise AssertionError(f"没有预设响应：{kd.api_name(path)}")
@@ -169,7 +169,7 @@ class RobustFieldsTests(Base):
     def fake_server(self, bad, renamed=()):
         """bad: 不存在的字段；renamed: 只支持基础写法的引用字段（X.FNumber 不行，X 行）。
         报错时不点名字段（像 SQL 列名错误那样），逼 robust_fields 走二分。"""
-        def post(path, body, retries=2):
+        def post(path, body, attempts=3):
             keys = body["data"]["FieldKeys"].split(",")
             for k in keys:
                 if k in bad or k in renamed:
@@ -254,6 +254,7 @@ class MainOutputTests(Base):
     def run_main(self, argv, client):
         out = io.StringIO()
         with patch.object(kd, "resolve_config", return_value=client.cfg), \
+             patch.object(kd, "stable_order", lambda c, f, fields: ""), \
              patch.object(kd, "Client", return_value=client), \
              patch.object(kd, "load_forms", lambda c, refresh=False: FORMS), \
              patch.object(kd, "scan_status", lambda c: SCAN), \
@@ -385,9 +386,10 @@ class NetworkPrivacyTests(Base):
 
     def test_main_redacts_any_error_message(self):
         c = self.real_client()
-        c._post = lambda path, body, retries=2: fail("无法访问 secret-tenant.example.invalid 的资源", as_list=True)
+        c._post = lambda path, body, attempts=3: fail("无法访问 secret-tenant.example.invalid 的资源", as_list=True)
         out = io.StringIO()
         with patch.object(kd, "resolve_config", return_value=c.cfg), patch.object(kd, "Client", return_value=c), \
+             patch.object(kd, "stable_order", lambda c, f, fields: ""), \
              patch.object(kd, "load_forms", lambda c, refresh=False: FORMS), \
              patch.object(kd, "scan_status", lambda c: SCAN), \
              contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):

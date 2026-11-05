@@ -4,11 +4,13 @@
 只会调用读取类接口（白名单见 READ_METHODS），不会修改任何数据。
 配置优先级：环境变量 > ~/.config/kdcli/config.json 中的 profile
 """
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 import argparse
 import csv
+from decimal import Decimal
 import getpass
+import hashlib
 import http.cookiejar
 import json
 import os
@@ -58,7 +60,7 @@ CONFIG_KEYS = {
 class KDError(Exception):
     """code: config | auth | not_found | ambiguous | server | rate_limit | network | readonly"""
 
-    EXIT = {"config": 3, "auth": 3, "not_found": 4, "ambiguous": 4, "server": 4,
+    EXIT = {"internal": 1, "config": 3, "auth": 3, "not_found": 4, "ambiguous": 4, "server": 4,
             "readonly": 6, "rate_limit": 5, "network": 5}
 
     def __init__(self, message, code=None, data=None):
@@ -88,6 +90,19 @@ def api_name(path):
     return parts[-3] if len(parts) >= 3 else path
 
 
+_DEC_MARK = "\u2063kd-decimal:"
+
+
+def to_json(obj, indent=None):
+    """json.dumps，但 Decimal 输出为原样的 JSON 数字（不经过 float，位数不丢）。"""
+    def default(o):
+        if isinstance(o, Decimal):
+            return _DEC_MARK + str(o)
+        raise TypeError(f"无法序列化 {type(o).__name__}")
+    text = json.dumps(obj, ensure_ascii=False, indent=indent, default=default)
+    return re.sub('"' + re.escape(_DEC_MARK) + r'([^"]*)"', r"\1", text)
+
+
 def log(msg):
     if not QUIET:
         print(msg, file=sys.stderr, flush=True)
@@ -98,9 +113,24 @@ def log(msg):
 def load_config_file():
     try:
         with open(CONFIG_FILE, encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
     except FileNotFoundError:
         return {"default": "default", "profiles": {}}
+    except (OSError, ValueError) as e:
+        raise KDError(f"配置文件无法读取（{CONFIG_FILE}）：{e}", code="config")
+    if not isinstance(data, dict) or not isinstance(data.get("profiles", {}), dict):
+        raise KDError(f"配置文件格式不正确（{CONFIG_FILE}）：应为 {{\"profiles\": {{...}}}}", code="config")
+    return data
+
+
+def _positive_number(name, value, cast=float):
+    try:
+        v = cast(value)
+    except (TypeError, ValueError):
+        v = None
+    if v is None or v <= 0:
+        raise KDError(f"{name} 必须是正数，当前是 {value!r}", code="config")
+    return v
 
 
 def save_config_file(data):
@@ -118,29 +148,65 @@ def resolve_config(profile_name):
         if os.environ.get(env):
             cfg[key] = os.environ[env]
     cfg.setdefault("lcid", 2052)
+    cfg["lcid"] = int(_positive_number("lcid（KD_LCID）", cfg["lcid"], int))
     cfg["_profile"] = name
+    cfg["_rate"] = _positive_number("KD_RATE", os.environ.get("KD_RATE", 450))
+    cfg["_timeout"] = _positive_number("KD_TIMEOUT", os.environ.get("KD_TIMEOUT", 180))
     if not cfg.get("url"):
-        raise KDError(f"未配置服务地址。请先运行 `kd config init`（profile: {name}）")
+        raise KDError(f"未配置服务地址。请先运行 `kd config init`（profile: {name}）", code="config")
     if not cfg["url"].endswith("/"):
         cfg["url"] += "/"
     return cfg
 
 
+def identity_namespace(cfg):
+    """会话和缓存的命名空间：profile + 地址/账套/用户的摘要。
+    同一个 profile 换了账套或用户，就是另一个命名空间，不会串用会话和元数据（#4）。
+    文件名里只出现摘要，不暴露地址、账套和用户名。"""
+    ident = "\n".join([(cfg.get("url") or "").strip().lower().rstrip("/"),
+                       str(cfg.get("acct_id") or ""), str(cfg.get("username") or "")])
+    digest = hashlib.sha256(ident.encode("utf-8")).hexdigest()[:12]
+    profile = re.sub(r"[^\w.-]", "_", cfg.get("_profile") or "default")
+    return f"{profile}-{digest}"
+
+
+def _private_file(path):
+    """会话文件就是登录凭据：保证只有自己能读写，也修正旧文件的宽权限。"""
+    try:
+        if os.path.exists(path) and (os.stat(path).st_mode & 0o077):
+            os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 # ================================================================ 客户端
+
+RETRYABLE_HTTP = {429, 502, 503, 504}
+MAX_ATTEMPTS = 3
+
 
 class Client:
     def __init__(self, cfg, verbose=False):
         self.cfg = cfg
         self.verbose = verbose
-        self.lock = threading.Lock()
+        self.user_id = None
+        # 两把锁各管一件事，持有其中一把时不会再去申请另一把，避免死锁（#2）：
+        #   login_lock 只用来让会话失效后的重登串行进行；
+        #   jar_lock 只保护会话文件的读写，持有期间不做任何网络请求。
+        self.login_lock = threading.Lock()
+        self.jar_lock = threading.Lock()
         self.rate_lock = threading.Lock()
         self.next_slot = 0.0
         # 服务器限制每分钟 500 次 WebAPI 调用；客户端默认按每分钟 450 次节流
-        self.min_interval = 60.0 / float(os.environ.get("KD_RATE", 450))
+        self.min_interval = 60.0 / cfg.get("_rate", 450)
+        self.timeout = cfg.get("_timeout", 180)
+        ns = identity_namespace(cfg)
+        self.cache_dir = os.path.join(CACHE_DIR, ns)
         os.makedirs(CONFIG_DIR, exist_ok=True)
-        self.cookie_path = os.path.join(CONFIG_DIR, f"session-{cfg['_profile']}.txt")
+        self.cookie_path = os.path.join(CONFIG_DIR, f"session-{ns}.txt")
         self.jar = http.cookiejar.LWPCookieJar(self.cookie_path)
         if os.path.exists(self.cookie_path):
+            _private_file(self.cookie_path)
             try:
                 self.jar.load(ignore_discard=True, ignore_expires=True)
             except Exception:
@@ -155,6 +221,18 @@ class Client:
         if wait > 0:
             time.sleep(wait)
 
+    def _save_session(self):
+        """原子写入会话文件，权限 0600。"""
+        with self.jar_lock:
+            tmp = f"{self.cookie_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+            try:
+                self.jar.save(tmp, ignore_discard=True, ignore_expires=True)
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, self.cookie_path)
+            finally:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+
     def redact(self, text):
         """把服务地址（完整 URL、主机名）替换成 <server>。
         TLS 证书错误、HTTP 错误正文等都可能带出租户主机名。"""
@@ -166,32 +244,58 @@ class Client:
                 text = re.sub(re.escape(secret), "<server>", text, flags=re.I)
         return text
 
-    def _post(self, path, body, retries=2):
-        self._throttle()
+    @staticmethod
+    def _backoff(attempt, retry_after=None):
+        """第 n 次失败后等待的秒数：优先用服务器给的 Retry-After（最多 60 秒），否则 1、2、4…（最多 8 秒）。"""
+        if retry_after and str(retry_after).strip().isdigit():
+            return min(int(retry_after), 60)
+        return min(2 ** (attempt - 1), 8)
+
+    def _http_error(self, path, e):
+        detail = e.read().decode("utf-8", "replace")[:500] if e.fp else ""
+        hint = ""
+        if e.code in (401, 403, 404) and "/k3cloud" not in self.cfg["url"].lower():
+            hint = "（服务地址一般要包含部署根路径，常见为 https://<主机>/k3cloud/）"
+        code = {429: "rate_limit", 401: "auth", 403: "auth", 404: "config"}.get(
+            e.code, "network" if e.code >= 500 else "server")
+        return KDError(self.redact(f"HTTP {e.code}{hint}: {detail}"), code=code)
+
+    def _post(self, path, body, attempts=MAX_ATTEMPTS):
+        """发请求。attempts > 1 时，网络错误和 HTTP 429/502/503/504 会按退避重试（#5）。"""
         url = self.cfg["url"] + path
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
-        if self.verbose:
-            log(f">>> POST {path} ({len(payload)} bytes; body omitted)")
         req = urllib.request.Request(url, data=payload, method="POST",
                                      headers={"Content-Type": "application/json"})
-        try:
-            with self.opener.open(req, timeout=180) as resp:
-                text = resp.read().decode("utf-8-sig")
-        except urllib.error.HTTPError as e:
-            raise KDError(self.redact(f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:500]}"))
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
-            if retries > 0:
-                time.sleep(2)
-                return self._post(path, body, retries - 1)
-            # 不在错误信息里带出服务地址：agent 模式下错误会写进 stdout，可能被记录到日志
-            raise KDError(self.redact(f"无法连接服务器（{api_name(path)}）：{getattr(e, 'reason', e)}"),
-                          code="network")
+        for attempt in range(1, attempts + 1):
+            self._throttle()
+            if self.verbose:
+                log(f">>> POST {path} ({len(payload)} bytes; body omitted)")
+            try:
+                with self.opener.open(req, timeout=self.timeout) as resp:
+                    text = resp.read().decode("utf-8-sig")
+                break
+            except urllib.error.HTTPError as e:
+                if e.code in RETRYABLE_HTTP and attempt < attempts:
+                    wait = self._backoff(attempt, e.headers.get("Retry-After") if e.headers else None)
+                    log(f"  HTTP {e.code}，{wait} 秒后重试（{attempt}/{attempts - 1}）…")
+                    time.sleep(wait)
+                    continue
+                raise self._http_error(path, e)
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+                if attempt < attempts:
+                    wait = self._backoff(attempt)
+                    log(f"  网络错误，{wait} 秒后重试（{attempt}/{attempts - 1}）…")
+                    time.sleep(wait)
+                    continue
+                # 不在错误信息里带出服务地址：agent 模式下错误会写进 stdout，可能被记录到日志
+                raise KDError(self.redact(f"无法连接服务器（{api_name(path)}）：{getattr(e, 'reason', e)}"),
+                              code="network")
         if self.verbose:
             log(f"<<< response ({len(text)} characters; body omitted)")
-        with self.lock:
-            self.jar.save(ignore_discard=True, ignore_expires=True)
+        self._save_session()
         try:
-            return json.loads(text)
+            # 小数按 Decimal 解析，金额、数量不经过二进制浮点，位数原样保留（#7）
+            return json.loads(text, parse_float=Decimal)
         except json.JSONDecodeError:
             raise KDError(self.redact(f"服务器返回的不是 JSON: {text[:300]}"))
 
@@ -199,31 +303,38 @@ class Client:
         c = self.cfg
         for k in ("acct_id", "username"):
             if not c.get(k):
-                raise KDError(f"缺少配置项 {k}")
+                raise KDError(f"缺少配置项 {k}", code="config")
+        # 登录只请求一次：认证失败重试没有意义，还可能触发账号锁定（#5）
         if c.get("app_id") and c.get("app_secret"):
             res = self._post(AUTH_APPSECRET, {
                 "acctID": c["acct_id"], "userName": c["username"],
                 "appId": c["app_id"], "appSecret": c["app_secret"], "lcid": int(c["lcid"]),
-            })
+            }, attempts=1)
         elif c.get("password"):
             res = self._post(AUTH_PASSWORD, {
                 "acctID": c["acct_id"], "username": c["username"],
                 "password": c["password"], "lcid": int(c["lcid"]),
-            })
+            }, attempts=1)
         else:
-            raise KDError("请配置 app_id + app_secret，或 password")
+            raise KDError("请配置 app_id + app_secret，或 password", code="config")
+        if not isinstance(res, dict):
+            raise KDError("登录接口返回的格式不符合预期", code="auth")
         self.user_id = (res.get("Context") or {}).get("UserId")
         code = res.get("LoginResultType")
         if code not in (1, -5):
-            msg = res.get("Message") or res.get("MessageCode") or json.dumps(res, ensure_ascii=False)
-            raise KDError(f"登录失败（LoginResultType={code}）：{msg}")
+            msg = res.get("Message") or res.get("MessageCode") or json.dumps(res, ensure_ascii=False, default=str)
+            raise KDError(f"登录失败（LoginResultType={code}）：{msg}", code="auth")
         return res
 
-    def call(self, method, params, _retried=False):
+    def call(self, method, params, retry=True, _relogged=False):
+        """调用只读接口。retry=False 时网络和 HTTP 层只请求一次（kd call 使用）；
+        金蝶业务层的「限流」提示无论如何都会按提示的秒数等待后重试。"""
         if method not in READ_METHODS:
-            raise KDError(f"{method} 不是只读接口，已拒绝。允许：{', '.join(sorted(READ_METHODS))}")
-        for attempt in range(20):
-            res = self._post(f"{SVC}.DynamicFormService.{method}.common.kdsvc", params)
+            raise KDError(f"{method} 不是只读接口，已拒绝。允许：{', '.join(sorted(READ_METHODS))}",
+                          code="readonly")
+        attempts = MAX_ATTEMPTS if retry else 1
+        for _ in range(20):
+            res = self._post(f"{SVC}.DynamicFormService.{method}.common.kdsvc", params, attempts=attempts)
             status = find_status(res)
             msg = error_text(res) if status and not status.get("IsSuccess", True) else ""
             if "限流" not in msg:
@@ -235,38 +346,48 @@ class Client:
                 self.next_slot = max(self.next_slot, time.monotonic() + wait)
             self._throttle()
         else:
-            raise KDError("服务器持续限流，请稍后再试")
-        if status and not status.get("IsSuccess", True) and status.get("MsgCode") == 1 and not _retried:
-            with self.lock:
+            raise KDError("服务器持续限流，请稍后再试", code="rate_limit")
+        if status and not status.get("IsSuccess", True) and status.get("MsgCode") == 1 and not _relogged:
+            with self.login_lock:  # 只串行化重登；login() 内部只会用到 jar_lock
                 self.login()
-            return self.call(method, params, _retried=True)
+            return self.call(method, params, retry=retry, _relogged=True)
         return res
 
     # ---- 便捷方法
-    def query(self, form_id, fields, filter_="", order="", start=0, limit=2000, all_pages=False):
+    def query(self, form_id, fields, filter_="", order="", start=0, limit=2000, all_pages=False,
+              max_pages=None):
+        rows = []
+        for page in self.iter_query(form_id, fields, filter_, order, start, limit,
+                                    max_pages=max_pages if all_pages else 1):
+            rows.extend(page)
+        return rows
+
+    def iter_query(self, form_id, fields, filter_="", order="", start=0, limit=2000, max_pages=None):
+        """逐页产出 ExecuteBillQuery 的结果。
+
+        按实际返回的行数推进偏移，直到遇到空页才停：服务器有时一页给的比 Limit 少，
+        但后面还有数据，用「本页不满」判断结束会漏行（#3）。
+        max_pages 限制请求页数，到达上限时提示结果可能不完整。"""
         para = {"FormId": form_id, "FieldKeys": ",".join(fields), "FilterString": filter_ or "",
                 "OrderString": order or "", "TopRowCount": 0, "StartRow": start, "Limit": limit}
-        rows = []
+        pages = 0
         while True:
-            res = check(self.call("ExecuteBillQuery", {"data": para}))
-            rows.extend(res)
-            if not all_pages or limit == 0 or len(res) < limit:
-                return rows
-            para["StartRow"] += limit
-
-    def iter_query(self, form_id, fields, filter_="", limit=2000):
-        """逐页产出，避免一次性占用大量内存。"""
-        para = {"FormId": form_id, "FieldKeys": ",".join(fields), "FilterString": filter_ or "",
-                "OrderString": "", "TopRowCount": 0, "StartRow": 0, "Limit": limit}
-        while True:
-            res = check(self.call("ExecuteBillQuery", {"data": para}))
-            yield res
-            if len(res) < limit:
+            page = check(self.call("ExecuteBillQuery", {"data": para}))
+            if not isinstance(page, list) or any(not isinstance(r, list) or len(r) != len(fields) for r in page):
+                raise KDError(f"{form_id} 返回的数据格式不符合预期（应为每行 {len(fields)} 列的列表）")
+            pages += 1
+            if page:
+                yield page
+            if not page or limit == 0:  # Limit=0 表示服务器一次返回全部
                 return
-            para["StartRow"] += limit
+            if max_pages is not None and pages >= max_pages:
+                if max_pages > 1:
+                    log(f"  已达到页数上限 {max_pages}，结果可能不完整")
+                return
+            para["StartRow"] += len(page)
 
     def metadata(self, form_id, refresh=False):
-        path = os.path.join(CACHE_DIR, self.cfg["_profile"], "meta", f"{form_id}.json")
+        path = os.path.join(self.cache_dir, "meta", f"{form_id}.json")
         if not refresh and os.path.exists(path):
             with open(path, encoding="utf-8") as f:
                 return json.load(f)
@@ -274,7 +395,7 @@ class Client:
         meta = res.get("Result", {}).get("NeedReturnData") or {}
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(meta, f, ensure_ascii=False)
+            f.write(to_json(meta))
         return meta
 
 
@@ -293,7 +414,7 @@ def error_text(res):
     status = find_status(res) or {}
     errs = status.get("Errors") or []
     return "; ".join(f"{e.get('FieldName') or ''} {e.get('Message')}".strip() for e in errs) \
-        or json.dumps(status, ensure_ascii=False)
+        or to_json(status)
 
 
 def check(res):
@@ -406,16 +527,16 @@ def robust_fields(client, form_id, keys, max_tries=40):
 # ================================================================ 表单目录
 
 def load_forms(client, refresh=False):
-    path = os.path.join(CACHE_DIR, client.cfg["_profile"], "forms.json")
+    path = os.path.join(client.cache_dir, "forms.json")
     if not refresh and os.path.exists(path):
         with open(path, encoding="utf-8") as f:
             return json.load(f)
     log("正在下载表单目录（约 1 万条，首次需要几十秒）…")
     subs = {r[0]: (r[1], r[2]) for r in client.query(
-        "BOS_SubSystem", ["FID", "FName", "FTopClassId.FName"], all_pages=True)}
+        "BOS_SubSystem", ["FID", "FName", "FTopClassId.FName"], order="FID ASC", all_pages=True)}
     forms = []
     for fid, name, mtype, sub in client.query(
-            "BOS_ObjectType", ["FID", "FName", "FModelTypeId", "FSubSystemId"], all_pages=True):
+            "BOS_ObjectType", ["FID", "FName", "FModelTypeId", "FSubSystemId"], order="FID ASC", all_pages=True):
         sname, cloud = subs.get(sub, ("", ""))
         forms.append({"id": fid, "name": name or "", "type": str(mtype), "cloud": cloud or "",
                       "subsystem": sname or "", "ext": bool(GUID_RE.match(fid or ""))})
@@ -454,7 +575,7 @@ def out(data, fmt="json", columns=None, file=None):
     if fmt == "json" or columns is None:
         if columns is not None:
             data = [dict(zip(columns, r)) for r in data]
-        print(json.dumps(data, ensure_ascii=False, indent=2), file=file)
+        print(to_json(data, indent=2), file=file)
         return
     rows = [["" if v is None else v for v in r] for r in data]
     if fmt == "csv":
@@ -536,8 +657,12 @@ def cmd_dbs(args, client):
 
 
 def cmd_login(args, client):
-    ctx = client.login().get("Context", {})
-    print(f"登录成功：{ctx.get('UserName', client.cfg['username'])} @ {ctx.get('DataCenterName', '')}")
+    client.login()
+    # 只确认登录结果，不默认输出用户名、数据中心等环境信息（#6）
+    if args.json_output:
+        print(to_json({"authenticated": True, "profile": client.cfg["_profile"]}))
+    else:
+        print(f"登录成功（profile: {client.cfg['_profile']}）")
 
 
 def cmd_forms(args, client):
@@ -616,7 +741,7 @@ def resolve_form(client, spec, prefer=None):
 
 
 def scan_status(client):
-    path = os.path.join(CACHE_DIR, client.cfg["_profile"], "scan.json")
+    path = os.path.join(client.cache_dir, "scan.json")
     if not os.path.exists(path):
         return {}
     with open(path, encoding="utf-8") as fp:
@@ -625,7 +750,7 @@ def scan_status(client):
 
 def entity_fields(client, form_id, entity="head", refresh=False):
     """某实体可查询的全部字段（结果缓存，之后查询不再试探）。"""
-    path = os.path.join(CACHE_DIR, client.cfg["_profile"], "fields", f"{form_id}__{entity}.json")
+    path = os.path.join(client.cache_dir, "fields", f"{form_id}__{entity}.json")
     if not refresh and os.path.exists(path):
         with open(path, encoding="utf-8") as fp:
             d = json.load(fp)
@@ -650,12 +775,36 @@ def resolve_field_arg(client, form_id, spec):
     return entity_fields(client, form_id, spec[1:] or "head")
 
 
+def stable_order(client, form_id, fields):
+    """分页用的稳定排序：表头主键，加上查询涉及到的分录/子分录内码，保证每行顺序唯一（#3）。"""
+    try:
+        groups = entity_groups(client.metadata(form_id))
+    except KDError:
+        return ""
+    used = {f.split(".")[0] for f in fields}
+    keys = []
+    for _, pks, flds in groups:
+        if not keys or used & {k for k, _, _ in flds} or used & set(pks):
+            for k in pks:
+                if k not in keys:
+                    keys.append(k)
+    return ",".join(f"{k} ASC" for k in keys)
+
+
 def cmd_query(args, client):
     form_id = args.form_id
     fields, dropped = resolve_field_arg(client, form_id, args.fields)
     if dropped and args.verbose_fields:
         log(f"以下字段服务器不支持查询，已跳过：{', '.join(dropped)}")
-    rows = client.query(form_id, fields, args.filter, args.order, args.start, args.limit, args.all)
+    order = args.order or stable_order(client, form_id, fields)
+    try:
+        rows = client.query(form_id, fields, args.filter, order, args.start, args.limit, args.all, args.max_pages)
+    except KDError as e:
+        if args.order or not order or e.code != "server":
+            raise
+        # 个别表单的主键不能用于排序：退回服务器默认顺序
+        log(f"  无法按主键排序（{e}），改用服务器默认顺序，翻页结果可能不稳定")
+        rows = client.query(form_id, fields, args.filter, "", args.start, args.limit, args.all, args.max_pages)
     out(rows, args.format, fields)
 
 
@@ -697,7 +846,7 @@ def cmd_check(args, client):
             if n % 100 == 0 or n == len(ids):
                 log(f"  {n}/{len(ids)}")
     rows.sort(key=lambda r: (r[2] != "ok", r[0], r[1] != "head", r[1]))
-    path = os.path.join(CACHE_DIR, client.cfg["_profile"], "check.json")
+    path = os.path.join(client.cache_dir, "check.json")
     merged = rows
     if args.form_ids and os.path.exists(path):  # 部分检查：合并进已有结果
         with open(path, encoding="utf-8") as fp:
@@ -729,7 +878,7 @@ def cmd_groups(args, client):
 
 def report_schemes(client, form_id):
     rows = client.query("BOS_FilterScheme", ["FSCHEMEID", "FSchemeName", "FUserID", "FIsShare", "FIsDefault", "FScheme"],
-                        filter_=f"FFormID='{form_id}'", all_pages=True)
+                        filter_=f"FFormID='{form_id}'", order="FSCHEMEID ASC", all_pages=True)
     me = getattr(client, "user_id", None)
     # 优先：有内容的方案（系统空白方案没有过滤条件，查出来常是 0 行）> 自己的 > 共享的 > 默认
     rows.sort(key=lambda r: (not r[5], r[2] != me, not r[3], not r[4]))
@@ -738,12 +887,13 @@ def report_schemes(client, form_id):
 
 def report_columns(client, form_id):
     """从该报表所有已保存过滤方案的 ColumnSetting 里收集列名（按显示顺序）。"""
-    path = os.path.join(CACHE_DIR, client.cfg["_profile"], "report_cols", f"{form_id}.json")
+    path = os.path.join(client.cache_dir, "report_cols", f"{form_id}.json")
     if os.path.exists(path):
         with open(path, encoding="utf-8") as fp:
             return json.load(fp)
     order = {}
-    for (sch,) in client.query("BOS_FilterScheme", ["FScheme"], f"FFormID='{form_id}'", all_pages=True):
+    for (sch,) in client.query("BOS_FilterScheme", ["FScheme"], f"FFormID='{form_id}'",
+                               order="FSCHEMEID ASC", all_pages=True):
         m = re.search(r"<ColumnSetting>(.*?)</ColumnSetting>", sch or "", re.S)
         if not m:
             continue
@@ -757,7 +907,7 @@ def report_columns(client, form_id):
 
 
 def save_report_columns(client, form_id, cols):
-    path = os.path.join(CACHE_DIR, client.cfg["_profile"], "report_cols", f"{form_id}.json")
+    path = os.path.join(client.cache_dir, "report_cols", f"{form_id}.json")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as fp:
         json.dump(cols, fp, ensure_ascii=False)
@@ -828,7 +978,7 @@ def cmd_attachments(args, client):
     fields = ["FID", "FBillType", "FBillNo", "FInterID", "FAttachmentName", "FExtName",
               "FCreateTime", "FCreateMen.FName", "FFileId"]
     rows = client.query("BOS_Attachment", fields, " and ".join(cond + ["FFileId<>' '"]),
-                        "FCreateTime DESC", 0, args.limit, args.all)
+                        "FCreateTime DESC,FID DESC", 0, args.limit, args.all)
     out(rows, args.format, ["附件ID", "表单", "单据编号", "单据内码", "文件名", "类型", "上传时间", "上传人", "FileId"])
 
 
@@ -867,7 +1017,8 @@ def cmd_download(args, client):
 def cmd_call(args, client):
     data = read_json_arg(args.data)
     params = {"data": data} if args.form_id is None else {"formid": args.form_id, "data": data}
-    out(client.call(args.method, params))
+    # 直接调用只请求一次，不做网络层重试；业务失败按统一的错误格式和退出码返回（#5 #6）
+    out(check(client.call(args.method, params, retry=False)))
 
 
 # ---------------------------------------------------------------- scan / export
@@ -898,7 +1049,7 @@ def scan_one(client, f):
                 return rec
             key = ok_keys[0]
         n = 0
-        for page in client.iter_query(f["id"], [key], limit=10000):
+        for page in client.iter_query(f["id"], [key], order=f"{key} ASC", limit=10000):
             n += len(page)
         rec["行数"] = n
         rec["状态"] = "ok"
@@ -919,7 +1070,7 @@ def cmd_scan(args, client):
             results.append(r)
             if i % 50 == 0 or i == len(forms):
                 log(f"  {i}/{len(forms)}")
-    path = os.path.join(CACHE_DIR, client.cfg["_profile"], "scan.json")
+    path = os.path.join(client.cache_dir, "scan.json")
     if args.form_ids and os.path.exists(path):  # 只扫了部分表单：合并进已有结果
         with open(path, encoding="utf-8") as fp:
             old = {r["FormId"]: r for r in json.load(fp)}
@@ -952,7 +1103,7 @@ def export_one(client, form_id, outdir, fmt, force):
     total = 0
     notes = []
     with open(os.path.join(fdir, "_fields.json"), "w", encoding="utf-8") as fp:
-        json.dump(meta, fp, ensure_ascii=False, indent=1)
+        fp.write(to_json(meta, indent=1))
     for name, pks, fields in entity_groups(meta):
         keys = pks + [lookup_key(k, lk) for k, lk, _ in fields]
         titles = {k: t for k, _, t in fields}
@@ -970,12 +1121,12 @@ def export_one(client, form_id, outdir, fmt, force):
             w = csv.writer(fp) if fmt == "csv" else None
             if w:
                 w.writerow(header)
-            for page in client.iter_query(form_id, keys):
+            for page in client.iter_query(form_id, keys, order=",".join(f"{k} ASC" for k in pks if k in keys)):
                 for r in page:
                     if w:
                         w.writerow(["" if v is None else v for v in r])
                     else:
-                        fp.write(json.dumps(dict(zip(keys, r)), ensure_ascii=False) + "\n")
+                        fp.write(to_json(dict(zip(keys, r))) + "\n")
                 n += len(page)
         if n == 0:
             os.remove(path)
@@ -989,7 +1140,7 @@ def select_forms(args, client):
     if args.form_ids:
         return [{"id": i, "name": "", "type": "", "cloud": "", "subsystem": ""} for i in args.form_ids]
     if getattr(args, "from_scan", False):
-        path = os.path.join(CACHE_DIR, client.cfg["_profile"], "scan.json")
+        path = os.path.join(client.cache_dir, "scan.json")
         if not os.path.exists(path):
             raise KDError("还没有扫描结果，请先运行 `kd scan`")
         with open(path, encoding="utf-8") as fp:
@@ -1078,6 +1229,7 @@ def build_parser():
     s.add_argument("-n", "--limit", type=int, default=100, help="每页行数（默认 100）")
     s.add_argument("--start", type=int, default=0)
     s.add_argument("-a", "--all", action="store_true", help="自动翻页取全部")
+    s.add_argument("--max-pages", type=int, help="和 -a 一起用：最多请求多少页（达到上限会提示结果可能不完整）")
     fmt(s)
     s.set_defaults(func=cmd_query)
 
@@ -1181,8 +1333,12 @@ def main(argv=None):
     if hasattr(args, "format") and args.format is None:
         args.format = os.environ.get("KD_FORMAT") or ("table" if interactive else "json")
     json_errors = getattr(args, "format", None) == "json" or not interactive
+    args.json_output = json_errors
     client = None
     try:
+        if args.cmd == "call" and args.method not in READ_METHODS:  # 不读配置就先拒绝写接口
+            raise KDError(f"{args.method} 不是只读接口，已拒绝。允许：{', '.join(sorted(READ_METHODS))}",
+                          code="readonly")
         if getattr(args, "local", False):
             return args.func(args)
         client = Client(resolve_config(args.profile), verbose=args.verbose)
@@ -1195,11 +1351,20 @@ def main(argv=None):
             err = {"code": e.code, "message": message}
             if e.data:
                 err.update(e.data)
-            print(json.dumps({"error": err}, ensure_ascii=False, indent=2))
+            print(to_json({"error": err}, indent=2))
         log(f"错误：{message}")
         sys.exit(KDError.EXIT.get(e.code, 1))
     except KeyboardInterrupt:
         sys.exit(130)
+    except Exception as e:  # 程序缺陷：也按统一格式输出，不让调用方面对 traceback
+        message = client.redact(f"{type(e).__name__}: {e}") if client else f"{type(e).__name__}: {e}"
+        if json_errors:
+            print(to_json({"error": {"code": "internal", "message": message}}, indent=2))
+        log(f"内部错误：{message}（加 -v 查看调用栈）")
+        if args.verbose:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
