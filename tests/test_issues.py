@@ -300,6 +300,22 @@ class Issue7PrecisionTests(Base):
         self.assertIn("2.50", text)
         self.assertEqual(json.loads(text, parse_float=Decimal)[0]["FAmount"], Decimal("1234567890.123456789"))
 
+    def test_strings_that_look_like_internal_markers_are_untouched(self):
+        # PR #8 review：旧实现用占位符加全局替换，这类普通字符串会被误改成数字或产生非法 JSON
+        for text in ("⁣kd-decimal:123", "⁣kd-decimal:hello", '"quoted"', "kd-decimal:1"):
+            with self.subTest(text=text):
+                obj = {"FName": text, "FAmount": Decimal("1.10")}
+                parsed = json.loads(kd.to_json(obj), parse_float=Decimal)
+                self.assertEqual(parsed, obj)
+
+    def test_matches_json_dumps_for_plain_data(self):
+        samples = [{}, [], {"a": [1, 2, {"b": None, "c": True}], "d": 'x"y\n', "e": []},
+                   [[1, "二"], [2.5, {}]], {1: "int key", "k": {"n": [{}]}}, "s", 3, None]
+        for obj in samples:
+            for indent in (None, 1, 2):
+                with self.subTest(obj=obj, indent=indent):
+                    self.assertEqual(kd.to_json(obj, indent), json.dumps(obj, ensure_ascii=False, indent=indent))
+
     def test_decimals_in_csv(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):

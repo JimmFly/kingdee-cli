@@ -90,17 +90,33 @@ def api_name(path):
     return parts[-3] if len(parts) >= 3 else path
 
 
-_DEC_MARK = "\u2063kd-decimal:"
-
-
 def to_json(obj, indent=None):
-    """json.dumps，但 Decimal 输出为原样的 JSON 数字（不经过 float，位数不丢）。"""
-    def default(o):
+    """和 json.dumps(obj, ensure_ascii=False, indent=indent) 输出一致，
+    但 Decimal 直接输出为原样的 JSON 数字（不经过 float，位数不丢）。
+
+    逐层自己拼接容器，标量交给 json.dumps；不使用占位符和全局替换，
+    所以任何字符串内容都会原样保留。"""
+    def enc(o, level):
         if isinstance(o, Decimal):
-            return _DEC_MARK + str(o)
-        raise TypeError(f"无法序列化 {type(o).__name__}")
-    text = json.dumps(obj, ensure_ascii=False, indent=indent, default=default)
-    return re.sub('"' + re.escape(_DEC_MARK) + r'([^"]*)"', r"\1", text)
+            if not o.is_finite():
+                raise TypeError(f"无法序列化非有限数 {o}")
+            return str(o)
+        if isinstance(o, dict):
+            return wrap("{", "}", [f"{json.dumps(k if isinstance(k, str) else json.dumps(k), ensure_ascii=False)}: "
+                                   f"{enc(v, level + 1)}" for k, v in o.items()], level)
+        if isinstance(o, (list, tuple)):
+            return wrap("[", "]", [enc(v, level + 1) for v in o], level)
+        return json.dumps(o, ensure_ascii=False)
+
+    def wrap(open_, close, items, level):
+        if not items:
+            return open_ + close
+        if indent is None:
+            return open_ + ", ".join(items) + close
+        pad, end = " " * (indent * (level + 1)), " " * (indent * level)
+        return open_ + "\n" + ",\n".join(pad + i for i in items) + "\n" + end + close
+
+    return enc(obj, 0)
 
 
 def log(msg):
