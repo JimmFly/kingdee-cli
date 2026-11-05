@@ -342,6 +342,61 @@ class NetworkPrivacyTests(Base):
         self.assertNotIn("secret-tenant", str(cm.exception))
         self.assertIn("View", str(cm.exception))
 
+    def real_client(self):
+        cfg = dict(url="https://Secret-Tenant.example.invalid/k3cloud/", _profile="t",
+                   acct_id="a", username="u", password="p", lcid=2052)
+        with patch.object(kd, "CONFIG_DIR", self.tmp.name):
+            c = kd.Client(cfg)
+        c.min_interval = 0
+        return c
+
+    def assert_redacted(self, exc):
+        self.assertNotIn("secret-tenant", str(exc).lower())
+        self.assertIn("<server>", str(exc))
+
+    def test_tls_hostname_error_is_redacted(self):
+        reason = ("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, "
+                  "certificate is not valid for 'secret-tenant.example.invalid'.")
+        c = self.real_client()
+        with patch.object(c.opener, "open", side_effect=kd.urllib.error.URLError(reason)):
+            with self.assertRaises(kd.KDError) as cm:
+                c.call("View", {})
+        self.assert_redacted(cm.exception)
+
+    def test_http_error_body_is_redacted(self):
+        body = io.BytesIO(b"<html>Bad gateway at https://secret-tenant.example.invalid/k3cloud/x</html>")
+        err = kd.urllib.error.HTTPError("https://secret-tenant.example.invalid/", 502, "Bad Gateway", {}, body)
+        c = self.real_client()
+        with patch.object(c.opener, "open", side_effect=err):
+            with self.assertRaises(kd.KDError) as cm:
+                c.call("View", {})
+        self.assert_redacted(cm.exception)
+
+    def test_non_json_response_is_redacted(self):
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def read(self): return b"Redirecting to SECRET-TENANT.example.invalid/login"
+        c = self.real_client()
+        with patch.object(c.opener, "open", return_value=Response()):
+            with self.assertRaises(kd.KDError) as cm:
+                c.call("View", {})
+        self.assert_redacted(cm.exception)
+
+    def test_main_redacts_any_error_message(self):
+        c = self.real_client()
+        c._post = lambda path, body, retries=2: fail("无法访问 secret-tenant.example.invalid 的资源", as_list=True)
+        out = io.StringIO()
+        with patch.object(kd, "resolve_config", return_value=c.cfg), patch.object(kd, "Client", return_value=c), \
+             patch.object(kd, "load_forms", lambda c, refresh=False: FORMS), \
+             patch.object(kd, "scan_status", lambda c: SCAN), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                kd.main(["-q", "query", "BD_MATERIAL", "-f", "FNumber"])
+        message = json.loads(out.getvalue())["error"]["message"]
+        self.assertNotIn("secret-tenant", message.lower())
+        self.assertIn("<server>", message)
+
 
 class EncodingTests(unittest.TestCase):
     def test_piped_output_uses_utf8_even_if_locale_is_not(self):

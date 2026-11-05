@@ -18,6 +18,7 @@ import threading
 import time
 import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -154,6 +155,17 @@ class Client:
         if wait > 0:
             time.sleep(wait)
 
+    def redact(self, text):
+        """把服务地址（完整 URL、主机名）替换成 <server>。
+        TLS 证书错误、HTTP 错误正文等都可能带出租户主机名。"""
+        text = str(text)
+        url = self.cfg.get("url") or ""
+        host = urllib.parse.urlsplit(url).hostname or ""
+        for secret in sorted({url.rstrip("/"), host}, key=len, reverse=True):
+            if secret:
+                text = re.sub(re.escape(secret), "<server>", text, flags=re.I)
+        return text
+
     def _post(self, path, body, retries=2):
         self._throttle()
         url = self.cfg["url"] + path
@@ -166,13 +178,14 @@ class Client:
             with self.opener.open(req, timeout=180) as resp:
                 text = resp.read().decode("utf-8-sig")
         except urllib.error.HTTPError as e:
-            raise KDError(f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:500]}")
+            raise KDError(self.redact(f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:500]}"))
         except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
             if retries > 0:
                 time.sleep(2)
                 return self._post(path, body, retries - 1)
             # 不在错误信息里带出服务地址：agent 模式下错误会写进 stdout，可能被记录到日志
-            raise KDError(f"无法连接服务器（{api_name(path)}）：{getattr(e, 'reason', e)}", code="network")
+            raise KDError(self.redact(f"无法连接服务器（{api_name(path)}）：{getattr(e, 'reason', e)}"),
+                          code="network")
         if self.verbose:
             log(f"<<< response ({len(text)} characters; body omitted)")
         with self.lock:
@@ -180,7 +193,7 @@ class Client:
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            raise KDError(f"服务器返回的不是 JSON: {text[:300]}")
+            raise KDError(self.redact(f"服务器返回的不是 JSON: {text[:300]}"))
 
     def login(self):
         c = self.cfg
@@ -1168,6 +1181,7 @@ def main(argv=None):
     if hasattr(args, "format") and args.format is None:
         args.format = os.environ.get("KD_FORMAT") or ("table" if interactive else "json")
     json_errors = getattr(args, "format", None) == "json" or not interactive
+    client = None
     try:
         if getattr(args, "local", False):
             return args.func(args)
@@ -1176,12 +1190,13 @@ def main(argv=None):
             args.form_id = resolve_form(client, args.form_id, prefer="900" if args.cmd == "report" else None)
         args.func(args, client)
     except KDError as e:
+        message = client.redact(e) if client else str(e)  # 最后一道防线：任何错误都不带出服务地址
         if json_errors:
-            err = {"code": e.code, "message": str(e)}
+            err = {"code": e.code, "message": message}
             if e.data:
                 err.update(e.data)
             print(json.dumps({"error": err}, ensure_ascii=False, indent=2))
-        log(f"错误：{e}")
+        log(f"错误：{message}")
         sys.exit(KDError.EXIT.get(e.code, 1))
     except KeyboardInterrupt:
         sys.exit(130)
