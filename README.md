@@ -31,6 +31,8 @@ kd login                                               # 3. 登录测试
 kd query 销售订单 -n 5                                  # 4. 开始查询
 ```
 
+**服务地址要写到 API 根路径**，公有云和大多数部署是 `https://<主机>/k3cloud/`。只写主机（`https://<主机>/`）通常会返回 HTTP 403 或 404，kd 会在错误里提示这一点。
+
 ## 配置
 
 `kd config init` 会把配置写到 `~/.config/kdcli/config.json`（权限 600）。密码和 AppSecret 输入时不回显。
@@ -52,6 +54,7 @@ kd query 销售订单 -n 5                                  # 4. 开始查询
 | `KD_PROFILE` | 使用哪个 profile |
 | `KD_FORMAT` | 默认输出格式：`table` / `json` / `csv` |
 | `KD_RATE` | 每分钟最多调用次数，默认 450 |
+| `KD_TIMEOUT` | 单次请求超时秒数，默认 180 |
 | `KD_CONFIG_DIR` | 配置和缓存目录，默认 `~/.config/kdcli` |
 
 ## 命令一览
@@ -87,7 +90,9 @@ kd groups 物料
 - 表单可以写 FormId，也可以写中文名。同名时优先单据；名字有歧义时会列出候选。
 - 引用字段默认输出编码，用户字段输出姓名。也可以自己写 `FCustId.FName` 这样的引用属性。
 - 服务器不支持的字段会自动跳过（`--show-skipped` 显示是哪些）。可用字段会缓存，之后直接查。
-- `-n` 每页行数（默认 100），`--start` 偏移，`-a` 自动翻页取全部。
+- `-n` 每页行数（默认 100），`--start` 偏移，`-a` 自动翻页取全部，`--max-pages` 限制自动翻页的页数。
+- 没写 `--order` 时按主键排序（涉及分录字段时再加分录内码），保证翻页结果稳定、不重不漏。
+- 自动翻页按实际返回的行数推进，直到返回空页才结束；服务器某页少给几行也不会漏数据。
 
 ## 找表单、看结构
 
@@ -131,18 +136,41 @@ kd export SAL_SaleOrder -d ./out   # 导出表单全部数据（表头和各分�
 kd export --from-scan -d ./out     # 导出 scan 发现有数据的所有表单
 ```
 
-结果在 `~/.config/kdcli/cache/<profile>/` 下。整库扫描要调用几千次接口，受限流影响会持续较长时间。
+结果在缓存目录下（见「限流与缓存」）。整库扫描要调用几千次接口，受限流影响会持续较长时间。
+
+**`scan` 统计的是查询返回的行数，不是单据数**：没有去重，主键不可查询时会改用其他表头字段计数。要统计单据数，请按表头主键（如 `FID`）去重；统计明细行数，请按「表头主键 + 分录内码」计数。
 
 ## 给 agent 用
 
 见 [AGENTS.md](AGENTS.md)：调用约定、错误码、标准查询流程、过滤语法、报表示例和常用 FormId。
 
-要点：stdout 不是终端时默认输出 JSON；失败时输出 `{"error": {"code", "message"}}`，退出码 3 为配置/登录问题，4 为业务错误或表单名歧义，5 为限流/网络，6 为写操作被拒。
+输出约定：
+
+- stdout 不是终端时，结果默认是 JSON，写到 stdout；进度和提示写到 stderr（`-q` 关闭）。
+- 失败时 stdout 输出 `{"error": {"code": ..., "message": ...}}`，同时在 stderr 打印一行说明。
+- `kd login` 成功时输出 `{"authenticated": true, "profile": ...}`，不输出用户名和数据中心等环境信息。
+
+| 退出码 | `error.code` | 含义 |
+|---|---|---|
+| 0 | — | 成功 |
+| 1 | `internal` | 程序内部错误（请提 issue，`-v` 可看调用栈） |
+| 2 | — | 命令参数错误（argparse 输出用法，不是 JSON） |
+| 3 | `config` / `auth` | 配置缺失或非法、登录失败、HTTP 401/403/404 |
+| 4 | `server` / `ambiguous` / `not_found` | 金蝶返回业务错误；中文名匹配到多个表单 |
+| 5 | `rate_limit` / `network` | 限流、网络错误、HTTP 5xx，已自动重试过 |
+| 6 | `readonly` | 调用了写接口 |
+
+### 数值精度
+
+金额、数量等小数按十进制原样保留：JSON 输出里的数字和服务器返回的位数完全一致，不经过二进制浮点。
+调用方如果要做财务计算，解析 JSON 时也应使用十进制类型，例如 Python 的 `json.loads(text, parse_float=decimal.Decimal)`。
 
 ## 限流与缓存
 
 - 金蝶服务器限制每分钟 500 次 WebAPI 调用。kd 默认每分钟最多 450 次，被限流时按服务器提示的秒数等待后自动重试。
+- 网络错误和 HTTP 429/502/503/504 最多尝试 3 次，按 `Retry-After` 或 1、2 秒的指数退避等待。登录和 `kd call` 只请求一次。
 - 会话过期会自动重新登录。
+- 会话和缓存按「profile + 服务地址 + 账套 + 用户」隔离，存放在 `~/.config/kdcli/session-<profile>-<摘要>.txt` 和 `~/.config/kdcli/cache/<profile>-<摘要>/`。同一个 profile 换了账套或用户，不会用到之前的会话和元数据。文件名里只有摘要，不包含地址、账套和用户名。会话文件权限为 600。
 - 表单目录、元数据、可用字段会缓存。系统新增了表单或字段后，用 `kd forms --refresh`、`kd fields <表单> --refresh` 刷新。
 
 ## 已知限制
@@ -168,7 +196,11 @@ kd export --from-scan -d ./out     # 导出 scan 发现有数据的所有表单
 python -m unittest discover -s tests -v   # 离线测试，不需要金蝶服务器
 ```
 
-所有代码在 [`kd.py`](kd.py) 一个文件里。测试用假的服务器响应覆盖只读白名单、限流重试、会话重登、字段自动修复、名称解析和 agent 输出格式。改动请附带测试。
+所有代码在 [`kd.py`](kd.py) 一个文件里。
+- `tests/test_core.py`：用假的服务器响应覆盖只读白名单、限流重试、会话重登、字段自动修复、名称解析和 agent 输出格式。
+- `tests/test_issues.py`：保留真实的请求流程、只替换最底层 HTTP，覆盖锁、分页、会话隔离、重试、输出契约和数值精度；部分测试以子进程运行 kd，检查 stdout 和退出码。
+
+改动请附带测试。
 
 ## 许可证
 
