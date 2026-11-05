@@ -1,0 +1,17 @@
+# 运行时产生的租户数据，不要提交
+scan-result.csv
+kd-export/
+*.csv
+*.jsonl
+__pycache__/
+.DS_Store
+
+# 本地凭据、会话和运行日志
+.env
+.env.*
+!.env.example
+config.json
+session-*.txt
+cache/
+.kdcli/
+*.log
