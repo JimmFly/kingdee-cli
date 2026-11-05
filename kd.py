@@ -4,6 +4,8 @@
 只会调用读取类接口（白名单见 READ_METHODS），不会修改任何数据。
 配置优先级：环境变量 > ~/.config/kdcli/config.json 中的 profile
 """
+__version__ = "0.1.0"
+
 import argparse
 import csv
 import getpass
@@ -77,6 +79,12 @@ class KDError(Exception):
 
 
 QUIET = False
+
+
+def api_name(path):
+    """'Kingdee.BOS...DynamicFormService.View.common.kdsvc' -> 'View'"""
+    parts = path.split(".")
+    return parts[-3] if len(parts) >= 3 else path
 
 
 def log(msg):
@@ -163,7 +171,8 @@ class Client:
             if retries > 0:
                 time.sleep(2)
                 return self._post(path, body, retries - 1)
-            raise KDError(f"无法连接 {url}: {getattr(e, 'reason', e)}")
+            # 不在错误信息里带出服务地址：agent 模式下错误会写进 stdout，可能被记录到日志
+            raise KDError(f"无法连接服务器（{api_name(path)}）：{getattr(e, 'reason', e)}", code="network")
         if self.verbose:
             log(f"<<< response ({len(text)} characters; body omitted)")
         with self.lock:
@@ -1006,6 +1015,7 @@ def cmd_export(args, client):
 
 def build_parser():
     p = argparse.ArgumentParser(prog="kd", description="金蝶云星空 WebAPI 只读命令行工具")
+    p.add_argument("--version", action="version", version=f"kd {__version__}")
     p.add_argument("-p", "--profile", help="使用哪个配置 profile")
     p.add_argument("-v", "--verbose", action="store_true", help="打印请求方法和响应大小（不含地址、请求及响应正文）")
     p.add_argument("-q", "--quiet", action="store_true", help="不输出提示信息（只输出结果）")
@@ -1134,11 +1144,24 @@ def build_parser():
     return p
 
 
+def _utf8_streams():
+    """Windows 等系统的管道默认用本地编码（如 cp1252），输出中文会报错。
+    被程序调用时统一用 UTF-8；在终端里则把无法显示的字符替换掉，而不是崩溃。"""
+    for stream in (sys.stdout, sys.stderr):
+        if not hasattr(stream, "reconfigure") or (stream.encoding or "").lower().replace("-", "") == "utf8":
+            continue
+        if stream.isatty():
+            stream.reconfigure(errors="replace")
+        else:
+            stream.reconfigure(encoding="utf-8")
+
+
 def main(argv=None):
     global QUIET
     import signal
     if hasattr(signal, "SIGPIPE"):
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    _utf8_streams()
     args = build_parser().parse_args(argv)
     QUIET = args.quiet
     interactive = sys.stdout.isatty()

@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kingdee-cli"
+dynamic = ["version"]
+description = "金蝶云星空 WebAPI 只读命令行工具，适合 agent 调用"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "JimmFly" }]
+keywords = ["kingdee", "k3cloud", "金蝶", "金蝶云星空", "webapi", "cli", "agent"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Natural Language :: Chinese (Simplified)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Office/Business :: Financial :: Accounting",
+]
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/JimmFly/kingdee-cli"
+
+[project.scripts]
+kd = "kd:main"
+
+[tool.setuptools]
+py-modules = ["kd"]
+
+[tool.setuptools.dynamic]
+version = { attr = "kd.__version__" }
